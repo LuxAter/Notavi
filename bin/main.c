@@ -1,5 +1,10 @@
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NOTAVI_STRINGIFY_IMPL(s) #s
@@ -19,6 +25,8 @@
   NOTAVI_STRINGIFY(NOTAVI_VERSION_MAJOR)                                       \
   "." NOTAVI_STRINGIFY(NOTAVI_VERSION_MINOR) "." NOTAVI_STRINGIFY(             \
       NOTAVI_VERSION_PATCH)
+
+#define NOTAVI_TAB_STOP 8
 
 #define CTRL_KEY(k) ((k)&0x1f)
 
@@ -36,14 +44,21 @@ enum EditorKey {
 
 typedef struct erow {
   int size;
+  int rsize;
   char *chars;
+  char *render;
 } erow;
 
 struct EditorConfig {
   int screen_rows, screen_cols;
   int cx, cy;
+  int rx;
+  int rowoff, coloff;
   int numrows;
-  erow row;
+  erow *row;
+  char *filename;
+  char statusmsg[80];
+  time_t statusmsg_time;
   struct termios original_termios;
 };
 
@@ -62,12 +77,8 @@ void disable_raw_mode() {
     die("tcsetattr");
 }
 
-void alternate_screen_buffer() {
-  write(STDOUT_FILENO, "\x1b[?1049h", 8);
-}
-void primary_screen_buffer() {
-  write(STDOUT_FILENO, "\x1b[?1049l", 8);
-}
+void alternate_screen_buffer() { write(STDOUT_FILENO, "\x1b[?1049h", 8); }
+void primary_screen_buffer() { write(STDOUT_FILENO, "\x1b[?1049l", 8); }
 
 void enable_raw_mode() {
   alternate_screen_buffer();
@@ -188,14 +199,74 @@ bool get_window_size(int *rows, int *cols) {
   }
 }
 
-void editor_open() {
-  char *line = "Hello, world!";
-  ssize_t linelen = 13;
-  Editor.row.size = linelen;
-  Editor.row.chars = malloc(linelen + 1);
-  memcpy(Editor.row.chars, line, linelen);
-  Editor.row.chars[linelen] = '\0';
-  Editor.numrows = 1;
+int editor_row_cx_to_rx(erow *row, int cx) {
+  int rx = 0;
+  for (int j = 0; j < cx; ++j) {
+    if (row->chars[j] == '\t')
+      rx += (NOTAVI_TAB_STOP - 1) - (rx % NOTAVI_TAB_STOP);
+    rx++;
+  }
+  return rx;
+}
+
+void editor_update_row(erow *row) {
+  int tabs = 0;
+  for (int j = 0; j < row->size; ++j) {
+    if (row->chars[j] == '\t')
+      tabs++;
+  }
+
+  free(row->render);
+  row->render = (char *)malloc(row->size + tabs * (NOTAVI_TAB_STOP - 1) + 1);
+
+  int idx = 0;
+  for (int j = 0; j < row->size; ++j) {
+    if (row->chars[j] == '\t') {
+      row->render[idx++] = ' ';
+      while (idx % NOTAVI_TAB_STOP != 0)
+        row->render[idx++] = ' ';
+    } else {
+      row->render[idx++] = row->chars[j];
+    }
+  }
+  row->render[idx] = '\0';
+  row->rsize = idx;
+}
+
+void editor_append_row(char *s, size_t len) {
+  Editor.row = (erow *)realloc(Editor.row, sizeof(erow) * (Editor.numrows + 1));
+
+  int at = Editor.numrows;
+  Editor.row[at].size = len;
+  Editor.row[at].chars = (char *)malloc(len + 1);
+  memcpy(Editor.row[at].chars, s, len);
+  Editor.row[at].chars[len] = '\0';
+
+  Editor.row[at].rsize = 0;
+  Editor.row[at].render = NULL;
+  editor_update_row(&Editor.row[at]);
+
+  Editor.numrows++;
+}
+
+void editor_open(char *filename) {
+  free(Editor.filename);
+  Editor.filename = strdup(filename);
+  FILE *fp = fopen(filename, "r");
+  if (!fp)
+    die("fopen");
+
+  char *line = NULL;
+  size_t linecap = 0;
+  ssize_t linelen;
+  while ((linelen = getline(&line, &linecap, fp)) != -1) {
+    while (linelen > 0 &&
+           (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
+      linelen--;
+    editor_append_row(line, linelen);
+  }
+  free(line);
+  fclose(fp);
 }
 
 struct abuf {
@@ -207,54 +278,120 @@ struct abuf {
   { NULL, 0 }
 
 void ab_append(struct abuf *ab, const char *s, int len) {
-  char *new = realloc(ab->b, ab->len + len);
+  char *new_buf = (char *)realloc(ab->b, ab->len + len);
 
-  if (new == NULL)
+  if (new_buf == NULL)
     return;
-  memcpy(&new[ab->len], s, len);
-  ab->b = new;
+  memcpy(&new_buf[ab->len], s, len);
+  ab->b = new_buf;
   ab->len += len;
 }
 
 void ab_free(struct abuf *ab) { free(ab->b); }
 
-void editor_draw_rows(struct abuf *ab) {
-  int y;
-  for (y = 0; y < Editor.screen_rows; ++y) {
-    if (y == Editor.screen_rows / 3) {
-      char welcome[80];
-      int welcome_len = snprintf(welcome, sizeof(welcome),
-                                 "Notavi Editor -- Version %s", NOTAVI_VERSION);
-      if (welcome_len > Editor.screen_cols)
-        welcome_len = Editor.screen_cols;
-      int padding = (Editor.screen_cols - welcome_len) / 2;
-      if (padding) {
-        ab_append(ab, "~", 1);
-        padding--;
-      }
-      while (padding--)
-        ab_append(ab, " ", 1);
-      ab_append(ab, welcome, welcome_len);
-    } else {
-      ab_append(ab, "~", 1);
-    }
-    ab_append(ab, "\x1b[K", 3);
-    if (y < Editor.screen_rows - 1) {
-      ab_append(ab, "\r\n", 2);
-    }
+void editor_scroll() {
+  Editor.rx = 0;
+  if (Editor.cy < Editor.numrows) {
+    Editor.rx = editor_row_cx_to_rx(&Editor.row[Editor.cy], Editor.cx);
+  }
+
+  if (Editor.cy < Editor.rowoff) {
+    Editor.rowoff = Editor.cy;
+  }
+  if (Editor.cy >= Editor.rowoff + Editor.screen_rows) {
+    Editor.rowoff = Editor.cy - Editor.screen_rows + 1;
+  }
+  if (Editor.rx < Editor.coloff) {
+    Editor.coloff = Editor.rx;
+  }
+  if (Editor.rx >= Editor.coloff + Editor.screen_cols) {
+    Editor.coloff = Editor.rx - Editor.screen_cols + 1;
   }
 }
 
+void editor_draw_rows(struct abuf *ab) {
+  int y;
+  for (y = 0; y < Editor.screen_rows; ++y) {
+    int filerow = y + Editor.rowoff;
+    if (filerow >= Editor.numrows) {
+      if (Editor.numrows == 0 && y == Editor.screen_rows / 3) {
+        char welcome[80];
+        int welcome_len =
+            snprintf(welcome, sizeof(welcome), "Notavi Editor -- Version %s",
+                     NOTAVI_VERSION);
+        if (welcome_len > Editor.screen_cols)
+          welcome_len = Editor.screen_cols;
+        int padding = (Editor.screen_cols - welcome_len) / 2;
+        if (padding) {
+          ab_append(ab, "~", 1);
+          padding--;
+        }
+        while (padding--)
+          ab_append(ab, " ", 1);
+        ab_append(ab, welcome, welcome_len);
+      } else {
+        ab_append(ab, "~", 1);
+      }
+    } else {
+      int len = Editor.row[filerow].rsize - Editor.coloff;
+      if (len < 0)
+        len = 0;
+      if (len > Editor.screen_cols)
+        len = Editor.screen_rows;
+      ab_append(ab, &Editor.row[filerow].render[Editor.coloff], len);
+    }
+    ab_append(ab, "\x1b[K", 3);
+    ab_append(ab, "\r\n", 2);
+  }
+}
+
+void editor_draw_status_bar(struct abuf *ab) {
+  ab_append(ab, "\x1b[7m", 4);
+  char status[80], rstatus[80];
+  int len =
+      snprintf(status, sizeof(status), "%.20s - %d lines",
+               Editor.filename ? Editor.filename : "[No Name]", Editor.numrows);
+  int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", Editor.cy + 1,
+                      Editor.numrows);
+  if (len > Editor.screen_cols)
+    len = Editor.screen_cols;
+  ab_append(ab, status, len);
+  while (len < Editor.screen_cols) {
+    if (Editor.screen_cols - len == rlen) {
+      ab_append(ab, rstatus, rlen);
+      break;
+    } else {
+      ab_append(ab, " ", 1);
+      len++;
+    }
+  }
+  ab_append(ab, "\x1b[m", 3);
+  ab_append(ab, "\r\n", 2);
+}
+
+void editor_draw_message_bar(struct abuf *ab) {
+  ab_append(ab, "\x1b[K", 3);
+  int msglen = strlen(Editor.statusmsg);
+  if(msglen > Editor.screen_cols) msglen = Editor.screen_cols;
+  if(msglen && time(NULL) - Editor.statusmsg_time < 5)
+    ab_append(ab, Editor.statusmsg, msglen);
+}
+
 void editor_refresh_screen() {
+  editor_scroll();
+
   struct abuf ab = ABUF_INIT;
 
   ab_append(&ab, "\x1b[?25l", 6);
   ab_append(&ab, "\x1b[H", 3);
 
   editor_draw_rows(&ab);
+  editor_draw_status_bar(&ab);
+  editor_draw_message_bar(&ab);
 
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", Editor.cy + 1, Editor.cx + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (Editor.cy - Editor.rowoff) + 1,
+           (Editor.rx - Editor.coloff) + 1);
   ab_append(&ab, buf, strlen(buf));
 
   ab_append(&ab, "\x1b[?25h", 6);
@@ -263,24 +400,48 @@ void editor_refresh_screen() {
   ab_free(&ab);
 }
 
+void editor_set_status_message(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(Editor.statusmsg, sizeof(Editor.statusmsg), fmt, ap);
+  va_end(ap);
+  Editor.statusmsg_time = time(NULL);
+}
+
 void editor_move_cursor(int key) {
+  erow *row = (Editor.cy >= Editor.numrows) ? NULL : &Editor.row[Editor.cy];
+
   switch (key) {
   case ARROW_LEFT:
-    if (Editor.cx != 0)
+    if (Editor.cx != 0) {
       Editor.cx--;
+    } else if (Editor.cy > 0) {
+      Editor.cy--;
+      Editor.cx = Editor.row[Editor.cy].size;
+    }
     break;
   case ARROW_RIGHT:
-    if (Editor.cx != Editor.screen_cols - 1)
+    if (row && Editor.cx < row->size) {
       Editor.cx++;
+    } else if (row && Editor.cx == row->size) {
+      Editor.cy++;
+      Editor.cx = 0;
+    }
     break;
   case ARROW_UP:
     if (Editor.cy != 0)
       Editor.cy--;
     break;
   case ARROW_DOWN:
-    if (Editor.cy != Editor.screen_rows - 1)
+    if (Editor.cy < Editor.numrows)
       Editor.cy++;
     break;
+  }
+
+  row = (Editor.cy >= Editor.numrows) ? NULL : &Editor.row[Editor.cy];
+  int rowlen = row ? row->size : 0;
+  if (Editor.cx > rowlen) {
+    Editor.cx = rowlen;
   }
 }
 
@@ -296,14 +457,21 @@ void editor_process_keypress() {
     Editor.cx = 0;
     break;
   case END_KEY:
-    Editor.cx = Editor.screen_cols - 1;
+    if (Editor.cy < Editor.numrows)
+      Editor.cx = Editor.row[Editor.cy].size;
     break;
   case PAGE_UP:
   case PAGE_DOWN: {
-    int times = Editor.screen_rows;
-    while (times--) {
-      editor_move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+    if (c == PAGE_UP) {
+      Editor.cx = Editor.rowoff;
+    } else if (c == PAGE_DOWN) {
+      Editor.cy = Editor.rowoff + Editor.screen_rows - 1;
+      if (Editor.cy > Editor.numrows)
+        Editor.cy = Editor.numrows;
     }
+    int times = Editor.screen_rows;
+    while (times--)
+      editor_move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
     break;
   }
   case ARROW_UP:
@@ -318,16 +486,29 @@ void editor_process_keypress() {
 void init_editor() {
   Editor.cx = 0;
   Editor.cy = 0;
+  Editor.rx = 0;
+  Editor.rowoff = 0;
+  Editor.coloff = 0;
   Editor.numrows = 0;
+  Editor.row = NULL;
+  Editor.filename = NULL;
+  Editor.statusmsg[0] = '\0';
+  Editor.statusmsg_time = 0;
+
   if (get_window_size(&Editor.screen_rows, &Editor.screen_cols) == false)
     die("get_window_size");
+  Editor.screen_rows -= 2;
 }
 
 int main(int argc, char *argv[]) {
   enable_raw_mode();
   init_editor();
 
-  editor_open();
+  if (argc >= 2) {
+    editor_open(argv[1]);
+  }
+
+  editor_set_status_message("HELP: Ctrl-Q = quit");
 
   while (true) {
     editor_refresh_screen();
