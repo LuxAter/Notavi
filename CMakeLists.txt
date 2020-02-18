@@ -3,7 +3,7 @@
 # PROJECT
 # ##############################################################################
 cmake_minimum_required(VERSION 3.11.0 FATAL_ERROR)
-project(Notavi VERSION 0.1.0)
+project(Notavi VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(NOTAVI_MAIN_PROJECT TRUE)
