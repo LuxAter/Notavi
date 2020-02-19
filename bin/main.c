@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -27,10 +28,12 @@
       NOTAVI_VERSION_PATCH)
 
 #define NOTAVI_TAB_STOP 8
+#define NOTAVI_QUIT_TIMES 3
 
 #define CTRL_KEY(k) ((k)&0x1f)
 
 enum EditorKey {
+  BACKSPACE = 127,
   ARROW_LEFT = 1000,
   ARROW_RIGHT,
   ARROW_UP,
@@ -55,6 +58,7 @@ struct EditorConfig {
   int rx;
   int rowoff, coloff;
   int numrows;
+  int dirty;
   erow *row;
   char *filename;
   char statusmsg[80];
@@ -63,6 +67,10 @@ struct EditorConfig {
 };
 
 static struct EditorConfig Editor;
+
+void editor_set_status_message(const char *fmt, ...);
+void editor_refresh_screen();
+char *editor_prompt(char *prompt, void (*callback)(char *, int));
 
 void die(const char *msg) {
   write(STDOUT_FILENO, "\x1b[2J", 4);
@@ -209,6 +217,19 @@ int editor_row_cx_to_rx(erow *row, int cx) {
   return rx;
 }
 
+int editor_row_rx_to_cx(erow *row, int rx) {
+  int cur_rx = 0;
+  int cx;
+  for (cx = 0; cx < row->size; cx++) {
+    if (row->chars[cx] == '\t')
+      cur_rx += (NOTAVI_TAB_STOP - 1) - (cur_rx % NOTAVI_TAB_STOP);
+    cur_rx++;
+    if (cur_rx > rx)
+      return cx;
+  }
+  return cx;
+}
+
 void editor_update_row(erow *row) {
   int tabs = 0;
   for (int j = 0; j < row->size; ++j) {
@@ -233,10 +254,14 @@ void editor_update_row(erow *row) {
   row->rsize = idx;
 }
 
-void editor_append_row(char *s, size_t len) {
-  Editor.row = (erow *)realloc(Editor.row, sizeof(erow) * (Editor.numrows + 1));
+void editor_insert_row(int at, char *s, size_t len) {
+  if (at < 0 || at > Editor.numrows)
+    return;
 
-  int at = Editor.numrows;
+  Editor.row = (erow *)realloc(Editor.row, sizeof(erow) * (Editor.numrows + 1));
+  memmove(&Editor.row[at + 1], &Editor.row[at],
+          sizeof(erow) * (Editor.numrows - at));
+
   Editor.row[at].size = len;
   Editor.row[at].chars = (char *)malloc(len + 1);
   memcpy(Editor.row[at].chars, s, len);
@@ -247,6 +272,111 @@ void editor_append_row(char *s, size_t len) {
   editor_update_row(&Editor.row[at]);
 
   Editor.numrows++;
+  Editor.dirty++;
+}
+
+void editor_free_row(erow *row) {
+  free(row->render);
+  free(row->chars);
+}
+
+void editor_delete_row(int at) {
+  if (at < 0 || at >= Editor.numrows)
+    return;
+  editor_free_row(&Editor.row[at]);
+  memmove(&Editor.row[at], &Editor.row[at + 1],
+          sizeof(erow) * (Editor.numrows - at - 1));
+  Editor.numrows--;
+  Editor.dirty++;
+}
+
+void editor_row_insert_char(erow *row, int at, int c) {
+  if (at < 0 || at > row->size)
+    at = row->size;
+  row->chars = (char *)realloc(row->chars, row->size + 2);
+  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+  row->size++;
+  row->chars[at] = c;
+  editor_update_row(row);
+  Editor.dirty++;
+}
+
+void editor_row_append_string(erow *row, char *s, size_t len) {
+  row->chars = (char *)realloc(row->chars, row->size + len + 1);
+  memcpy(&row->chars[row->size], s, len);
+  row->size += len;
+  row->chars[row->size] = '\0';
+  editor_update_row(row);
+  Editor.dirty++;
+}
+
+void editor_row_del_char(erow *row, int at) {
+  if (at < 0 || at >= row->size)
+    return;
+  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+  row->size--;
+  editor_update_row(row);
+  Editor.dirty++;
+}
+
+void editor_insert_char(int c) {
+  if (Editor.cy == Editor.numrows) {
+    editor_insert_row(Editor.numrows, "", 0);
+  }
+  editor_row_insert_char(&Editor.row[Editor.cy], Editor.cx, c);
+  Editor.cx++;
+}
+
+void editor_insert_newline() {
+  if (Editor.cx == 0) {
+    editor_insert_row(Editor.cy, "", 0);
+  } else {
+    erow *row = &Editor.row[Editor.cy];
+    editor_insert_row(Editor.cy + 1, &row->chars[Editor.cx],
+                      row->size - Editor.cx);
+    row = &Editor.row[Editor.cy];
+    row->size = Editor.cx;
+    row->chars[row->size] = '\0';
+    editor_update_row(row);
+  }
+  Editor.cy++;
+  Editor.cx = 0;
+}
+
+void editor_delete_char() {
+  if (Editor.cy == Editor.numrows)
+    return;
+  if (Editor.cx == 0 && Editor.cy == 0)
+    return;
+
+  erow *row = &Editor.row[Editor.cy];
+  if (Editor.cx > 0) {
+    editor_row_del_char(row, Editor.cx - 1);
+    Editor.cx--;
+  } else {
+    Editor.cx = Editor.row[Editor.cy - 1].size;
+    editor_row_append_string(&Editor.row[Editor.cy - 1], row->chars, row->size);
+    editor_delete_row(Editor.cy);
+    Editor.cy--;
+  }
+}
+
+char *editor_rows_to_string(int *buflen) {
+  int totlen = 0;
+  for (int j = 0; j < Editor.numrows; ++j) {
+    totlen += Editor.row[j].size + 1;
+  }
+  *buflen = totlen;
+
+  char *buf = (char *)malloc(totlen);
+  char *p = buf;
+  for (int j = 0; j < Editor.numrows; ++j) {
+    memcpy(p, Editor.row[j].chars, Editor.row[j].size);
+    p += Editor.row[j].size;
+    *p = '\n';
+    p++;
+  }
+  return buf;
 }
 
 void editor_open(char *filename) {
@@ -263,10 +393,95 @@ void editor_open(char *filename) {
     while (linelen > 0 &&
            (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
       linelen--;
-    editor_append_row(line, linelen);
+    editor_insert_row(Editor.numrows, line, linelen);
   }
   free(line);
   fclose(fp);
+  Editor.dirty = 0;
+}
+
+void editor_save() {
+  if (Editor.filename == NULL) {
+    Editor.filename = editor_prompt("Save as: %s", NULL);
+    if (Editor.filename == NULL) {
+      editor_set_status_message("Save aborted");
+      return;
+    }
+  }
+  int len;
+  char *buf = editor_rows_to_string(&len);
+  int fd = open(Editor.filename, O_RDWR | O_CREAT, 0644);
+  if (fd != -1) {
+    if (ftruncate(fd, len) != -1) {
+      if (write(fd, buf, len) == len) {
+        close(fd);
+        free(buf);
+        Editor.dirty = 0;
+        editor_set_status_message("%d bytes written to disk", len);
+        return;
+      }
+    }
+    close(fd);
+  }
+  free(buf);
+  editor_set_status_message("Can't save! I/O error: %s", strerror(errno));
+}
+
+void editor_find_callback(char *query, int key) {
+  static int last_match = -1;
+  static int direction = 1;
+
+  if (key == '\r' || key == '\x1b') {
+    last_match = -1;
+    direction = 1;
+    return;
+  } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+    direction = 1;
+  } else if (key == ARROW_LEFT || key == ARROW_UP) {
+    direction = -1;
+  } else {
+    last_match = -1;
+    direction = 1;
+  }
+
+  if (last_match == -1)
+    direction = 1;
+  int current = last_match;
+  for (int i = 0; i < Editor.numrows; ++i) {
+    current += direction;
+    if (current == -1)
+      current = Editor.numrows - 1;
+    else if (current == Editor.numrows)
+      current = 0;
+
+    erow *row = &Editor.row[current];
+    char *match = strstr(row->render, query);
+    if (match) {
+      last_match = current;
+      Editor.cy = current;
+      Editor.cx = editor_row_rx_to_cx(row, match - row->render);
+      Editor.rowoff = Editor.numrows;
+      break;
+    }
+  }
+}
+
+void editor_find() {
+  int saved_cx = Editor.cx;
+  int saved_cy = Editor.cy;
+  int saved_coloff = Editor.coloff;
+  int saved_rowoff = Editor.rowoff;
+
+  char *query =
+      editor_prompt("Search: %s (Use ESC/Arrows/Enter)", editor_find_callback);
+  if (query) {
+    free(query);
+  } else {
+    Editor.cx = saved_cx;
+    Editor.cy = saved_cy;
+    Editor.coloff = saved_coloff;
+    Editor.rowoff = saved_rowoff;
+  }
 }
 
 struct abuf {
@@ -348,9 +563,9 @@ void editor_draw_rows(struct abuf *ab) {
 void editor_draw_status_bar(struct abuf *ab) {
   ab_append(ab, "\x1b[7m", 4);
   char status[80], rstatus[80];
-  int len =
-      snprintf(status, sizeof(status), "%.20s - %d lines",
-               Editor.filename ? Editor.filename : "[No Name]", Editor.numrows);
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+                     Editor.filename ? Editor.filename : "[No Name]",
+                     Editor.numrows, Editor.dirty ? "(modified)" : "");
   int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", Editor.cy + 1,
                       Editor.numrows);
   if (len > Editor.screen_cols)
@@ -372,8 +587,9 @@ void editor_draw_status_bar(struct abuf *ab) {
 void editor_draw_message_bar(struct abuf *ab) {
   ab_append(ab, "\x1b[K", 3);
   int msglen = strlen(Editor.statusmsg);
-  if(msglen > Editor.screen_cols) msglen = Editor.screen_cols;
-  if(msglen && time(NULL) - Editor.statusmsg_time < 5)
+  if (msglen > Editor.screen_cols)
+    msglen = Editor.screen_cols;
+  if (msglen && time(NULL) - Editor.statusmsg_time < 5)
     ab_append(ab, Editor.statusmsg, msglen);
 }
 
@@ -400,12 +616,53 @@ void editor_refresh_screen() {
   ab_free(&ab);
 }
 
-void editor_set_status_message(const char* fmt, ...) {
+void editor_set_status_message(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(Editor.statusmsg, sizeof(Editor.statusmsg), fmt, ap);
   va_end(ap);
   Editor.statusmsg_time = time(NULL);
+}
+
+char *editor_prompt(char *prompt, void (*callback)(char *, int)) {
+  size_t bufsize = 128;
+  char *buf = (char *)malloc(bufsize);
+
+  size_t buflen = 0;
+  buf[0] = '\0';
+
+  while (true) {
+    editor_set_status_message(prompt, buf);
+    editor_refresh_screen();
+
+    int c = editor_read_key();
+    if (c == DELETE_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+      if (buflen != 0)
+        buf[--buflen] = '\0';
+    } else if (c == '\x1b') {
+      editor_set_status_message("");
+      if (callback)
+        callback(buf, c);
+      free(buf);
+      return NULL;
+    } else if (c == '\r') {
+      if (buflen != 0) {
+        editor_set_status_message("");
+        if (callback)
+          callback(buf, c);
+        return buf;
+      }
+    } else if (!iscntrl(c) && c < 128) {
+      if (buflen == bufsize - 1) {
+        bufsize *= 2;
+        buf = (char *)realloc(buf, bufsize);
+      }
+      buf[buflen++] = c;
+      buf[buflen] = '\0';
+    }
+    if (callback)
+      callback(buf, c);
+  }
 }
 
 void editor_move_cursor(int key) {
@@ -446,12 +703,23 @@ void editor_move_cursor(int key) {
 }
 
 void editor_process_keypress() {
+  static int quit_times = NOTAVI_QUIT_TIMES;
   int c = editor_read_key();
   switch (c) {
   case CTRL_KEY('q'):
+    if (Editor.dirty && quit_times > 0) {
+      editor_set_status_message("WARNING!!! File has unsaved changes. Press "
+                                "Ctrl-Q %d more times to quit.",
+                                quit_times);
+      quit_times--;
+      return;
+    }
     write(STDOUT_FILENO, "\x1b[2J", 4);
     write(STDOUT_FILENO, "\x1b[H", 3);
     exit(0);
+    break;
+  case CTRL_KEY('s'):
+    editor_save();
     break;
   case HOME_KEY:
     Editor.cx = 0;
@@ -480,7 +748,28 @@ void editor_process_keypress() {
   case ARROW_RIGHT:
     editor_move_cursor(c);
     break;
+  case '\r':
+    editor_insert_newline();
+    break;
+  case CTRL_KEY('f'):
+    editor_find();
+    break;
+  case BACKSPACE:
+  case CTRL_KEY('h'):
+  case DELETE_KEY:
+    if (c == DELETE_KEY)
+      editor_move_cursor(ARROW_RIGHT);
+    editor_delete_char();
+    break;
+  case CTRL_KEY('l'):
+  case '\x1b':
+    break;
+
+  default:
+    editor_insert_char(c);
+    break;
   }
+  quit_times = NOTAVI_QUIT_TIMES;
 }
 
 void init_editor() {
@@ -490,6 +779,7 @@ void init_editor() {
   Editor.rowoff = 0;
   Editor.coloff = 0;
   Editor.numrows = 0;
+  Editor.dirty = 0;
   Editor.row = NULL;
   Editor.filename = NULL;
   Editor.statusmsg[0] = '\0';
@@ -508,7 +798,8 @@ int main(int argc, char *argv[]) {
     editor_open(argv[1]);
   }
 
-  editor_set_status_message("HELP: Ctrl-Q = quit");
+  editor_set_status_message(
+      "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
   while (true) {
     editor_refresh_screen();
