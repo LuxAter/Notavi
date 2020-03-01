@@ -6,9 +6,9 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${NOTAVI_BINARY_DIR})
 # SOURCE FILES
 # ##############################################################################
 set(SOURCES
-  core.cpp)
+  core.cpp buffer.cpp serde.cpp)
 configure_file("${NOTAVI_SOURCE_DIR}/include/notavi/version.hpp.in"
-               "${NOTAVI_SOURCE_DIR}/include/notavi/version.hpp")
+  "${NOTAVI_SOURCE_DIR}/include/notavi/version.hpp")
 
 # ##############################################################################
 # STATIC TARGET
@@ -17,14 +17,15 @@ if(NOTAVI_BUILD_STATIC_LIBS)
   add_library(notavi_static STATIC ${SOURCES})
   add_library(notavi::static ALIAS notavi_static)
   target_include_directories(notavi_static
-                             PUBLIC ${NOTAVI_SOURCE_DIR}/include)
+    PRIVATE ${NOTAVI_SOURCE_DIR}/include/notavi)
   target_include_directories(notavi_static
-                             PRIVATE ${NOTAVI_SOURCE_DIR}/include/notavi)
+    PUBLIC ${NOTAVI_SOURCE_DIR}/include)
 
   set_target_properties(
     notavi_static
     PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS OFF)
-  target_compile_options(notavi_shared PRIVATE ${NOTAVI_CXX_FLAGS})
+  target_compile_options(notavi_static PRIVATE ${NOTAVI_CXX_FLAGS})
+  target_link_libraries(notavi_static PUBLIC magic_enum::magic_enum nlohmann_json::nlohmann_json cpptoml)
   if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(notavi_static PRIVATE ${NOTAVI_CXX_FLAGS_RELEASE})
   elseif (CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -40,14 +41,15 @@ if(NOTAVI_BUILD_SHARED_LIBS)
   add_library(notavi_shared SHARED ${SOURCES})
   add_library(notavi::shared ALIAS notavi_shared)
   target_include_directories(notavi_shared
-                             PUBLIC ${NOTAVI_SOURCE_DIR}/include)
+    PUBLIC ${NOTAVI_SOURCE_DIR}/include)
   target_include_directories(notavi_shared
-                             PRIVATE ${NOTAVI_SOURCE_DIR}/include/notavi)
+    PRIVATE ${NOTAVI_SOURCE_DIR}/include/notavi)
 
   set_target_properties(
     notavi_shared
     PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS OFF)
   target_compile_options(notavi_shared PRIVATE ${NOTAVI_CXX_FLAGS})
+  target_link_libraries(notavi_shared PUBLIC magic_enum::magic_enum nlohmann_json::nlohmann_json cpptoml)
   if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(notavi_shared PRIVATE ${NOTAVI_CXX_FLAGS_RELEASE})
   elseif (CMAKE_BUILD_TYPE STREQUAL "Debug")

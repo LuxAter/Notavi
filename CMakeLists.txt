@@ -1,13 +1,9 @@
- 
 # ##############################################################################
 # PROJECT
 # ##############################################################################
 cmake_minimum_required(VERSION 3.11.0 FATAL_ERROR)
 project(Notavi VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  set(NOTAVI_MAIN_PROJECT TRUE)
-endif()
 
 # ##############################################################################
 # OPTIONS
@@ -82,7 +78,7 @@ add_subdirectory(external)
 set(NOTAVI_COMPILERS MSVC GNU Clang Intel AppleClang)
 write_compiler_detection_header(
   FILE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include/specula/global/compiler.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/notavi/compiler.hpp
   PREFIX
   NOTAVI
   COMPILERS
@@ -96,18 +92,16 @@ write_compiler_detection_header(
 # ##############################################################################
 # LIBRARY
 # ##############################################################################
-add_subdirectory(src)
-if(NOTAVI_BUILD_BINARY)
-  add_subdirectory(bin)
-endif()
+add_subdirectory(lib)
+add_subdirectory(bin)
 
 # ##############################################################################
 # DOCUMENTATION
 # ##############################################################################
 if(NOTAVI_BUILD_DOCUMENTATION)
-  # find_package(Doxygen)
+  find_package(Doxygen)
   # if(Doxygen_FOUND)
-  #   add_subdirectory(docs)
+    # add_subdirectory(docs)
   # endif()
 endif()
 
